@@ -3,7 +3,7 @@
   "builds": [
     {
       "src": "api/index.py",
-      "use": "@vercel/python@3.11"  // 匹配你的 Python 版本
+      "use": "@vercel/python@3.11"
     }
   ],
   "routes": [
