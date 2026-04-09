@@ -15,8 +15,7 @@ from packing_parser import SUPPLIER_OPTIONS, fill_template_from_parsed, get_fixe
 SCENARIO_OPTIONS = {
     "方案1（HQ+FR）": "scenario1",
     "方案2（仅FR）": "scenario2",
-    "方案3（GP+HQ+FR）": "scenario3",
-    "方案4（全部箱型）": "scenario4",
+    "方案3（全部箱型：GP+HQ+FR）": "scenario3",
     "自动推荐": "auto",
     "一次生成全部方案": "all",
     "自定义箱型": "custom",
@@ -144,6 +143,19 @@ def main():
                 default=["40FR", "20FR"],
                 help="仅在“自定义箱型组合”场景生效。",
             )
+            priority_default = ",".join(custom_boxes) if custom_boxes else "40FR,20FR"
+            priority_text = st.text_input(
+                "箱型优先级顺序（逗号分隔）",
+                value=priority_default,
+                help="示例：40HQ,40FR,20FR,20GP。仅保留已勾选箱型，按你填写顺序配箱。",
+            )
+            typed = [x.strip() for x in priority_text.replace("，", ",").split(",") if x.strip()]
+            if typed:
+                ordered = [x for x in typed if x in custom_boxes]
+                for c in custom_boxes:
+                    if c not in ordered:
+                        ordered.append(c)
+                custom_boxes = ordered
         run = st.button("生成配箱结果", type="primary", use_container_width=True)
     else:
         supplier_label = st.selectbox("List 供应商模板", list(SUPPLIER_OPTIONS.keys()), index=0)
