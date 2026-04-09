@@ -34,6 +34,14 @@ UNDERFILLED_WIDTH_PENALTY_MULTIPLIER = 2.5
 FR_WIDTH_REMARK_LIMITS = {"20FR": 2226.0, "40FR": 2374.0}
 FR_HEIGHT_REMARK_LIMIT = 1900.0
 MODEL_DISPLAY_NAMES = {"710板": "710定制板", "880板": "880定制板"}
+# Additional loading safety margin for box L/W/H hard constraints.
+SIZE_SAFETY_MARGIN_MM = 75.0
+
+
+def _safe_cap(v: float) -> float:
+    return max(0.0, v - SIZE_SAFETY_MARGIN_MM)
+
+
 PARALLEL_MODEL_LIMITS: Dict[str, Tuple[float, float]] = {
     "20GP": (2300.0, 2150.0),  # 2200 minus door reserve
     "40GP": (2300.0, 2200.0),
@@ -85,23 +93,23 @@ class BoxRule:
 
 
 BOX_RULES: Dict[str, BoxRule] = {
-    "20GP": BoxRule("20GP", 5750, 2300, 2200, 21670, 900),
-    "40GP": BoxRule("40GP", 11450, 2300, 2200, 26480, 900),
-    "40HQ": BoxRule("40HQ", 11450, 2300, 2500, 26480, 900),
-    "20FR": BoxRule("20FR", 5450, None, 4500, 31200, 2500),
-    "40FR": BoxRule("40FR", 11250, None, 4500, 40000, 2500),
-    "710板": BoxRule("710板", 6700, 5800, 4500, 70000, 3500),
-    "880板": BoxRule("880板", 8100, 5800, 4500, 80000, 3500),
+    "20GP": BoxRule("20GP", _safe_cap(5850), _safe_cap(2300), _safe_cap(2200), 21670, 900),
+    "40GP": BoxRule("40GP", _safe_cap(11500), _safe_cap(2300), _safe_cap(2200), 26480, 900),
+    "40HQ": BoxRule("40HQ", _safe_cap(11500), _safe_cap(2300), _safe_cap(2500), 26480, 900),
+    "20FR": BoxRule("20FR", _safe_cap(5500), None, _safe_cap(4500), 31200, 2500),
+    "40FR": BoxRule("40FR", _safe_cap(11300), None, _safe_cap(4500), 40000, 2500),
+    "710板": BoxRule("710板", _safe_cap(6800), _safe_cap(5800), _safe_cap(4500), 70000, 3500),
+    "880板": BoxRule("880板", _safe_cap(8200), _safe_cap(5800), _safe_cap(4500), 80000, 3500),
 }
 
 BOARD_CODES = [c for c in BOX_RULES if "710" in c or "880" in c]
 
 SCENARIO_LABELS: Dict[str, str] = {
-    "scenario1": "??1(40HQ+FR)",
-    "scenario2": "??2(FR-only)",
-    "scenario3": "??3(???:GP+HQ+FR)",
-    "auto": "????(????HQ)",
-    "custom": "?????",
+    "scenario1": "方案1(40HQ+FR)",
+    "scenario2": "方案2(仅FR)",
+    "scenario3": "方案3(全部箱型:GP+HQ+FR)",
+    "auto": "自动推荐(可选启用HQ)",
+    "custom": "自定义箱型",
 }
 
 
@@ -938,19 +946,83 @@ def assignments_from_box_units(box_units: Dict[str, List[Unit]]) -> Dict[int, st
 
 def consolidate_tiny_underfilled_boxes(assignments: Dict[int, str], units: List[Unit]) -> Dict[int, str]:
     """
-    Post-process: merge tiny underfilled boxes into other opened boxes when feasible.
-    This targets pathological low-util boxes (like a tiny single piece in one box).
-    Width similarity is still preferred when picking target boxes.
+    Post-process underfilled boxes by merging into already-opened boxes when feasible.
+    Strategy:
+    1) Try whole-box merge first for tiny/short source boxes.
+    2) If whole-box merge fails, allow split-merge:
+       move source units one by one and distribute across multiple target boxes.
+    Width similarity is still preferred when selecting targets.
     """
     box_units = box_units_from_assignments(assignments, units)
     if not box_units:
         return assignments
 
+    def pick_best_target_for_units(
+        src_name: str,
+        src_rule: BoxRule,
+        moving_units: List[Unit],
+        dst_snapshot: Dict[str, List[Unit]],
+    ) -> str | None:
+        moving_len = used_length_of_units(moving_units)
+        moving_wt = sum(u.weight for u in moving_units)
+        moving_widths = [u.width for u in moving_units]
+        moving_wmin = min(moving_widths) if moving_widths else 0.0
+        moving_wmax = max(moving_widths) if moving_widths else 0.0
+
+        best_target = None
+        best_score = float("inf")
+        for dst_name, dst_units in dst_snapshot.items():
+            if dst_name == src_name:
+                continue
+            dst_model = dst_name.split("-", 1)[0]
+            rule = BOX_RULES.get(dst_model)
+            if rule is None:
+                continue
+            if any(not unit_fits_rule(u, rule) for u in moving_units):
+                continue
+
+            dst_len = used_length_of_units(dst_units)
+            if dst_len + moving_len > rule.length_cap:
+                continue
+            dst_wt = sum(u.weight for u in dst_units)
+            if rule.max_payload is not None and dst_wt + moving_wt > rule.max_payload:
+                continue
+
+            dst_widths = [u.width for u in dst_units]
+            dst_wmin = min(dst_widths) if dst_widths else 0.0
+            dst_wmax = max(dst_widths) if dst_widths else 0.0
+            nwmin = min(dst_wmin, moving_wmin)
+            nwmax = max(dst_wmax, moving_wmax)
+            span = nwmax - nwmin
+
+            # Try strict first; for tiny/light moving packages allow one relaxed fallback.
+            span_limit_strict = rule.width_hard_limit * 1.25
+            span_limit_relaxed = rule.width_hard_limit * 2.20
+            tiny_light_src = (moving_len <= src_rule.length_cap * 0.40) and (moving_wt <= 2000.0)
+            if span > span_limit_strict:
+                if (not tiny_light_src) or span > span_limit_relaxed:
+                    continue
+
+            merged_units = dst_units + moving_units
+            side_diff = estimate_side_diff(merged_units)
+            if any(u.weight >= BIG_PIECE_WEIGHT for u in merged_units) and side_diff > SIDE_WEIGHT_DIFF_LIMIT:
+                continue
+
+            # Width similarity first, then better length fill.
+            left = rule.length_cap - (dst_len + moving_len)
+            score = span * (rule.width_penalty * 3.0) + left
+            if score < best_score:
+                best_score = score
+                best_target = dst_name
+
+        return best_target
+
     changed = True
     while changed:
         changed = False
-        # Candidate source boxes: low length utilization and very short used length.
-        candidates: List[Tuple[str, float]] = []
+        # Candidate source boxes: low length utilization.
+        # Whole-box merge keeps old "tiny source" gate; split-merge can handle broader cases.
+        candidates: List[Tuple[str, float, float, float]] = []
         for box_name, us in box_units.items():
             model = box_name.split("-", 1)[0]
             rule = BOX_RULES.get(model)
@@ -958,11 +1030,11 @@ def consolidate_tiny_underfilled_boxes(assignments: Dict[int, str], units: List[
                 continue
             used_len = used_length_of_units(us)
             util = used_len / rule.length_cap
-            if util < LOW_LENGTH_UTIL_THRESHOLD and used_len <= rule.length_cap * 0.45:
-                candidates.append((box_name, util))
+            if util < LOW_LENGTH_UTIL_THRESHOLD:
+                candidates.append((box_name, util, used_len, rule.length_cap))
         candidates.sort(key=lambda x: x[1])
 
-        for src_name, _ in candidates:
+        for src_name, _, used_len, _ in candidates:
             if src_name not in box_units:
                 continue
             src_units = box_units[src_name]
@@ -970,62 +1042,42 @@ def consolidate_tiny_underfilled_boxes(assignments: Dict[int, str], units: List[
             src_rule = BOX_RULES.get(src_model)
             if src_rule is None:
                 continue
-            src_len = used_length_of_units(src_units)
-            src_wt = sum(u.weight for u in src_units)
-            src_widths = [u.width for u in src_units]
-            src_wmin = min(src_widths) if src_widths else 0.0
-            src_wmax = max(src_widths) if src_widths else 0.0
 
-            best_target = None
-            best_score = float("inf")
-            for dst_name, dst_units in box_units.items():
-                if dst_name == src_name:
-                    continue
-                dst_model = dst_name.split("-", 1)[0]
-                rule = BOX_RULES.get(dst_model)
-                if rule is None:
-                    continue
-                if any(not unit_fits_rule(u, rule) for u in src_units):
-                    continue
+            # 1) Whole-box merge first, but only for short/tiny source boxes.
+            if used_len <= src_rule.length_cap * 0.45:
+                dst_snapshot = {k: v for k, v in box_units.items() if k != src_name}
+                best_target = pick_best_target_for_units(src_name, src_rule, src_units, dst_snapshot)
+                if best_target is not None:
+                    box_units[best_target].extend(src_units)
+                    del box_units[src_name]
+                    changed = True
+                    break
 
-                dst_len = used_length_of_units(dst_units)
-                if dst_len + src_len > rule.length_cap:
-                    continue
-                dst_wt = sum(u.weight for u in dst_units)
-                if rule.max_payload is not None and dst_wt + src_wt > rule.max_payload:
-                    continue
+            # 2) Split-merge: allow moving source units into multiple target boxes.
+            dst_snapshot = {k: v[:] for k, v in box_units.items() if k != src_name}
+            if not dst_snapshot:
+                continue
+            move_plan: List[Tuple[Unit, str]] = []
+            # Move long/heavy units first to reduce dead-end risk.
+            ordered_src_units = sorted(src_units[:], key=lambda u: (u.length, u.weight), reverse=True)
+            feasible = True
+            for u in ordered_src_units:
+                target = pick_best_target_for_units(src_name, src_rule, [u], dst_snapshot)
+                if target is None:
+                    feasible = False
+                    break
+                move_plan.append((u, target))
+                dst_snapshot[target].append(u)
 
-                dst_widths = [u.width for u in dst_units]
-                dst_wmin = min(dst_widths) if dst_widths else 0.0
-                dst_wmax = max(dst_widths) if dst_widths else 0.0
-                nwmin = min(dst_wmin, src_wmin)
-                nwmax = max(dst_wmax, src_wmax)
-                span = nwmax - nwmin
-                # Try strict first; for tiny/light sources allow one relaxed fallback.
-                span_limit_strict = rule.width_hard_limit * 1.25
-                span_limit_relaxed = rule.width_hard_limit * 2.20
-                if span > span_limit_strict:
-                    tiny_light_src = (src_len <= src_rule.length_cap * 0.40) and (src_wt <= 2000.0)
-                    if (not tiny_light_src) or span > span_limit_relaxed:
-                        continue
-
-                merged_units = dst_units + src_units
-                side_diff = estimate_side_diff(merged_units)
-                if any(u.weight >= BIG_PIECE_WEIGHT for u in merged_units) and side_diff > SIDE_WEIGHT_DIFF_LIMIT:
-                    continue
-
-                # Width similarity first, then better length fill.
-                left = rule.length_cap - (dst_len + src_len)
-                score = span * (rule.width_penalty * 3.0) + left
-                if score < best_score:
-                    best_score = score
-                    best_target = dst_name
-
-            if best_target is not None:
-                box_units[best_target].extend(src_units)
-                del box_units[src_name]
-                changed = True
-                break
+            # Commit only if the source box can be fully emptied.
+            if feasible and len(move_plan) == len(src_units):
+                for u, target in move_plan:
+                    box_units[src_name].remove(u)
+                    box_units[target].append(u)
+                if not box_units[src_name]:
+                    del box_units[src_name]
+                    changed = True
+                    break
 
     return assignments_from_box_units(box_units)
 
@@ -1126,8 +1178,7 @@ def optimize_with_optional_boxes(units: List[Unit], rules: List[str]) -> Dict[in
         base_no = pack_by_rule_priority_mode(units, rules_no_20fr)
         cand_no = global_backoff_optimize(units, rules_no_20fr, base_no)
         obj_no = assignment_objective(cand_no, units)
-        no20fr_better = (obj_no[0] < best_obj[0]) or (obj_no[0] == best_obj[0] and obj_no[2] < best_obj[2])
-        if no20fr_better:
+        if should_replace_assignment(best, best_obj, cand_no, obj_no, units):
             best, best_obj = cand_no, obj_no
 
     # 20GP is only kept when it reduces total box count vs path without 20GP.
@@ -1136,7 +1187,7 @@ def optimize_with_optional_boxes(units: List[Unit], rules: List[str]) -> Dict[in
         base_no = pack_by_rule_priority_mode(units, rules_no_20gp)
         cand_no = global_backoff_optimize(units, rules_no_20gp, base_no)
         obj_no = assignment_objective(cand_no, units)
-        if obj_no[0] <= best_obj[0]:
+        if should_replace_assignment(best, best_obj, cand_no, obj_no, units):
             best, best_obj = cand_no, obj_no
 
     # Re-pack iteratively when boxes are underfilled by length.
@@ -1148,7 +1199,7 @@ def optimize_with_optional_boxes(units: List[Unit], rules: List[str]) -> Dict[in
         cand_merge = consolidate_tiny_underfilled_boxes(cand_merge, units)
         cand_merge = global_backoff_optimize(units, rules, cand_merge)
         obj_merge = assignment_objective(cand_merge, units)
-        if obj_merge < best_obj:
+        if should_replace_assignment(best, best_obj, cand_merge, obj_merge, units):
             best, best_obj = cand_merge, obj_merge
         else:
             break
@@ -1203,6 +1254,43 @@ def assignment_objective(assignments: Dict[int, str], units: List[Unit]) -> Tupl
     return (len(box_units), total_balance_excess, utilization_penalty, total_leftover)
 
 
+def assignment_box_volume(assignments: Dict[int, str], units: List[Unit]) -> float:
+    box_units = box_units_from_assignments(assignments, units)
+    if not box_units:
+        return 0.0
+    total = 0.0
+    for b in box_units.keys():
+        model = str(b).split("-", 1)[0]
+        total += box_volume_capacity(model)
+    return total
+
+
+def should_replace_assignment(
+    current: Dict[int, str],
+    current_obj: Tuple[int, float, float, float],
+    candidate: Dict[int, str],
+    candidate_obj: Tuple[int, float, float, float],
+    units: List[Unit],
+) -> bool:
+    # Unified rule across scenarios:
+    # 1) Fewer boxes wins.
+    # 2) If box count ties, choose the one with higher packing box-volume.
+    # 3) If still tied, fall back to original objective tuple.
+    if candidate_obj[0] < current_obj[0]:
+        return True
+    if candidate_obj[0] > current_obj[0]:
+        return False
+
+    cand_vol = assignment_box_volume(candidate, units)
+    cur_vol = assignment_box_volume(current, units)
+    if cand_vol > cur_vol + 1e-6:
+        return True
+    if cand_vol < cur_vol - 1e-6:
+        return False
+
+    return candidate_obj < current_obj
+
+
 def global_backoff_optimize(units: List[Unit], rule_codes: List[str], base: Dict[int, str]) -> Dict[int, str]:
     best = base.copy()
     best_obj = assignment_objective(best, units)
@@ -1211,7 +1299,7 @@ def global_backoff_optimize(units: List[Unit], rule_codes: List[str], base: Dict
     for mode, seed in strategies:
         cand = pack_by_rule_priority_mode(units, rule_codes, order_mode=mode, random_seed=seed)
         obj = assignment_objective(cand, units)
-        if obj < best_obj:
+        if should_replace_assignment(best, best_obj, cand, obj, units):
             best = cand
             best_obj = obj
     return best
@@ -1410,7 +1498,7 @@ def pack_scenario3(items: List[Item]) -> Dict[int, str]:
 def pack_custom(items: List[Item], box_codes: List[str]) -> Dict[int, str]:
     valid = [c for c in box_codes if c in BOX_RULES]
     if not valid:
-        raise ValueError("??????????????????")
+        raise ValueError("自定义模式下请至少选择一个有效箱型")
     uniq = list(dict.fromkeys(valid))
     # Keep user-defined priority order as-is.
     for b in BOARD_CODES:
@@ -1555,12 +1643,12 @@ def fill_box_formula_cells(
             row=r,
             column=18,
             value=(
-                f'=IF(J{r}="40FR",12064,'
-                f'IF(J{r}="20FR",6038,'
-                f'IF(J{r}="40GP",12192,'
-                f'IF(J{r}="40HQ",12192,'
-                f'IF(OR(J{r}="710板",J{r}="710定制板"),6700,'
-                f'IF(OR(J{r}="880板",J{r}="880定制板"),8100,0))))))'
+                f'=IF(J{r}="40FR",11300,'
+                f'IF(J{r}="20FR",5500,'
+                f'IF(J{r}="40GP",11500,'
+                f'IF(J{r}="40HQ",11500,'
+                f'IF(OR(J{r}="710板",J{r}="710定制板"),6800,'
+                f'IF(OR(J{r}="880板",J{r}="880定制板"),8200,0))))))'
             ),
         )  # R
         ws.cell(
@@ -1621,6 +1709,30 @@ def apply_uniform_generated_styles(ws, rows: List[int], style_map: Dict[int, obj
             cell._style = copy(st)
 
 
+def normalize_serial_value(v):
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    return v
+
+
+def apply_center_alignment(ws, start_row: int, end_row: int, start_col: int = 1, end_col: int = 24):
+    for r in range(start_row, end_row + 1):
+        for c in range(start_col, end_col + 1):
+            cell = ws.cell(row=r, column=c)
+            if isinstance(cell, MergedCell):
+                continue
+            cell.alignment = OUTPUT_ALIGN
+
+
+def apply_output_font(ws, start_row: int, end_row: int, start_col: int = 1, end_col: int = 24):
+    for r in range(start_row, end_row + 1):
+        for c in range(start_col, end_col + 1):
+            cell = ws.cell(row=r, column=c)
+            if isinstance(cell, MergedCell):
+                continue
+            cell.font = OUTPUT_FONT
+
+
 def apply_assignments(template_path: Path, output_path: Path, assignments: Dict[int, str], merge_groups: List[List[int]] | None = None):
     wb = load_workbook(template_path)
     ws = wb.active
@@ -1648,6 +1760,11 @@ def apply_assignments(template_path: Path, output_path: Path, assignments: Dict[
     source_active_rows = [
         r for r in range(DATA_START_ROW, ws.max_row + 1) if any(ws.cell(row=r, column=c).value not in (None, "") for c in range(1, 10))
     ]
+    source_serials = {
+        normalize_serial_value(values[r][0])
+        for r in source_active_rows
+        if values[r][0] not in (None, "")
+    }
 
     ordered_boxes = order_boxes(assignments, merge_groups or [])
     ordered_rows: List[int] = []
@@ -1665,6 +1782,8 @@ def apply_assignments(template_path: Path, output_path: Path, assignments: Dict[
         nr = DATA_START_ROW + idx
         old_to_new[old] = nr
         for c, v in enumerate(values[old], start=1):
+            if c == 1:
+                v = normalize_serial_value(v)
             ws.cell(row=nr, column=c, value=v)
         if old in style_map:
             for c in range(1, REMARK_COL + 1):
@@ -1747,6 +1866,19 @@ def apply_assignments(template_path: Path, output_path: Path, assignments: Dict[
 
     # Final pass: normalize all generated-content styles to template baseline.
     apply_uniform_generated_styles(ws, cargo_new_rows, generated_style_map)
+    # Restore required output font.
+    apply_output_font(ws, DATA_START_ROW, end_row, 1, 24)
+    # Restore centered display effect for final output range.
+    apply_center_alignment(ws, DATA_START_ROW, end_row, 1, 24)
+
+    # Hard guard: output serial set must be unchanged from input.
+    output_serials = {
+        normalize_serial_value(ws.cell(row=r, column=1).value)
+        for r in range(DATA_START_ROW, end_row + 1)
+        if ws.cell(row=r, column=1).value not in (None, "")
+    }
+    if output_serials != source_serials:
+        raise ValueError("Serial coverage mismatch after assignment; output aborted.")
     wb.save(output_path)
 
 
